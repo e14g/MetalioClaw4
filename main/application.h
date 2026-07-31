@@ -61,6 +61,9 @@ public:
     void SendMcpMessage(const std::string& payload);
     void SetAecMode(AecMode mode);
     AecMode GetAecMode() const { return aec_mode_; }
+    bool IsDeviceAecSupported() const;
+    bool IsDeviceAecEnabled() const;
+    void SetDeviceAecEnabled(bool enabled);
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
 
@@ -102,6 +105,8 @@ private:
     void CheckAssetsVersion();
     void ShowActivationCode(const std::string& code, const std::string& message);
     void SetListeningMode(ListeningMode mode);
+    ListeningMode ListeningModeForAec(ListeningMode fallback) const;
+    void LoadDeviceAecPreference();
 };
 
 

@@ -48,6 +48,30 @@ static const char* const STATE_STRINGS[] = {
     "invalid_state"
 };
 
+static const char* AecModeName(AecMode mode) {
+    switch (mode) {
+        case kAecOnDeviceSide:
+            return "device";
+        case kAecOnServerSide:
+            return "server";
+        case kAecOff:
+        default:
+            return "off";
+    }
+}
+
+static const char* ListeningModeName(ListeningMode mode) {
+    switch (mode) {
+        case kListeningModeRealtime:
+            return "realtime";
+        case kListeningModeManualStop:
+            return "manual";
+        case kListeningModeAutoStop:
+        default:
+            return "auto";
+    }
+}
+
 Application::Application() {
     event_group_ = xEventGroupCreate();
 
@@ -60,6 +84,21 @@ Application::Application() {
 #else
     aec_mode_ = kAecOff;
 #endif
+#if CONFIG_USE_DEVICE_AEC
+    constexpr bool kDeviceAecConfigured = true;
+#else
+    constexpr bool kDeviceAecConfigured = false;
+#endif
+#if CONFIG_USE_SERVER_AEC
+    constexpr bool kServerAecConfigured = true;
+#else
+    constexpr bool kServerAecConfigured = false;
+#endif
+    LoadDeviceAecPreference();
+    ESP_LOGI(TAG, "Audio AEC config device=%s server=%s mode=%s",
+        kDeviceAecConfigured ? "true" : "false",
+        kServerAecConfigured ? "true" : "false",
+        AecModeName(aec_mode_));
 
     esp_timer_create_args_t clock_timer_args = {
         .callback = [](void* arg) {
@@ -360,11 +399,12 @@ void Application::ToggleChatState() {
                 }
             }
 
-            SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
+            SetListeningMode(ListeningModeForAec(kListeningModeAutoStop));
         });
     } else if (device_state_ == kDeviceStateSpeaking) {
         Schedule([this]() {
             AbortSpeaking(kAbortReasonNone);
+            SetListeningMode(ListeningModeForAec(kListeningModeAutoStop));
         });
     } else if (device_state_ == kDeviceStateListening) {
         Schedule([this]() {
@@ -397,12 +437,12 @@ void Application::StartListening() {
                 }
             }
 
-            SetListeningMode(kListeningModeManualStop);
+            SetListeningMode(ListeningModeForAec(kListeningModeManualStop));
         });
     } else if (device_state_ == kDeviceStateSpeaking) {
         Schedule([this]() {
             AbortSpeaking(kAbortReasonNone);
-            SetListeningMode(kListeningModeManualStop);
+            SetListeningMode(ListeningModeForAec(kListeningModeManualStop));
         });
     }
 }
@@ -770,14 +810,15 @@ void Application::OnWakeWordDetected() {
         }
         // Set the chat state to wake word detected
         protocol_->SendWakeWordDetected("Hi 钛灵");
-        SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
+        SetListeningMode(ListeningModeForAec(kListeningModeAutoStop));
 #else
-        SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
+        SetListeningMode(ListeningModeForAec(kListeningModeAutoStop));
         // Play the pop up sound to indicate the wake word is detected
         audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
 #endif
     } else if (device_state_ == kDeviceStateSpeaking) {
         AbortSpeaking(kAbortReasonWakeWordDetected);
+        SetListeningMode(ListeningModeForAec(kListeningModeAutoStop));
     } else if (device_state_ == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);
     }
@@ -793,7 +834,13 @@ void Application::AbortSpeaking(AbortReason reason) {
 
 void Application::SetListeningMode(ListeningMode mode) {
     listening_mode_ = mode;
+    ESP_LOGI(TAG, "Set listening mode: %s aec_mode=%s",
+        ListeningModeName(listening_mode_), AecModeName(aec_mode_));
     SetDeviceState(kDeviceStateListening);
+}
+
+ListeningMode Application::ListeningModeForAec(ListeningMode fallback) const {
+    return aec_mode_ == kAecOff ? fallback : kListeningModeRealtime;
 }
 
 void Application::SetDeviceState(DeviceState state) {
@@ -963,15 +1010,16 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
         }
         // Set the chat state to wake word detected
         protocol_->SendWakeWordDetected(wake_word);
-        SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
+        SetListeningMode(ListeningModeForAec(kListeningModeAutoStop));
 #else
-        SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
+        SetListeningMode(ListeningModeForAec(kListeningModeAutoStop));
         // Play the pop up sound to indicate the wake word is detected
         audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
 #endif
     } else if (device_state_ == kDeviceStateSpeaking) {
         Schedule([this]() {
             AbortSpeaking(kAbortReasonNone);
+            SetListeningMode(ListeningModeForAec(kListeningModeAutoStop));
         });
     } else if (device_state_ == kDeviceStateListening) {   
         Schedule([this]() {
@@ -1015,30 +1063,73 @@ void Application::SendMcpMessage(const std::string& payload) {
 }
 
 void Application::SetAecMode(AecMode mode) {
+#if !CONFIG_USE_DEVICE_AEC
+    if (mode == kAecOnDeviceSide) {
+        ESP_LOGW(TAG, "Device AEC is not compiled in; forcing AEC off");
+        mode = kAecOff;
+    }
+#endif
     aec_mode_ = mode;
-    Schedule([this]() {
+    audio_service_.SetDeviceAecEnabled(aec_mode_ == kAecOnDeviceSide);
+    Schedule([this, mode]() {
         auto& board = Board::GetInstance();
         auto display = board.GetDisplay();
-        switch (aec_mode_) {
+        if (display == nullptr) {
+            return;
+        }
+        switch (mode) {
         case kAecOff:
-            audio_service_.EnableDeviceAec(false);
             display->ShowNotification(Lang::Strings::RTC_MODE_OFF);
             break;
         case kAecOnServerSide:
-            audio_service_.EnableDeviceAec(false);
             display->ShowNotification(Lang::Strings::RTC_MODE_ON);
             break;
         case kAecOnDeviceSide:
-            audio_service_.EnableDeviceAec(true);
             display->ShowNotification(Lang::Strings::RTC_MODE_ON);
             break;
         }
-
-        // If the AEC mode is changed, close the audio channel
-        if (protocol_ && protocol_->IsAudioChannelOpened()) {
-            protocol_->CloseAudioChannel();
-        }
     });
+}
+
+bool Application::IsDeviceAecSupported() const {
+#if CONFIG_USE_DEVICE_AEC
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool Application::IsDeviceAecEnabled() const {
+#if CONFIG_USE_DEVICE_AEC
+    return aec_mode_ == kAecOnDeviceSide;
+#else
+    return false;
+#endif
+}
+
+void Application::SetDeviceAecEnabled(bool enabled) {
+#if CONFIG_USE_DEVICE_AEC
+    Settings settings("audio", true);
+    settings.SetBool("device_aec_enabled", enabled);
+    SetAecMode(enabled ? kAecOnDeviceSide : kAecOff);
+    ESP_LOGI(TAG, "Device AEC setting saved: %s", enabled ? "enabled" : "disabled");
+#else
+    if (enabled) {
+        ESP_LOGW(TAG, "Device AEC setting ignored: not compiled in");
+    }
+    SetAecMode(kAecOff);
+#endif
+}
+
+void Application::LoadDeviceAecPreference() {
+#if CONFIG_USE_DEVICE_AEC
+    Settings settings("audio", false);
+    const bool enabled = settings.GetBool("device_aec_enabled", true);
+    aec_mode_ = enabled ? kAecOnDeviceSide : kAecOff;
+    audio_service_.SetDeviceAecEnabled(enabled);
+#else
+    audio_service_.SetDeviceAecEnabled(false);
+#endif
 }
 
 void Application::PlaySound(const std::string_view& sound) {

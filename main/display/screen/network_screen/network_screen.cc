@@ -20,9 +20,11 @@
 #include "ssid_manager.h"
 #include "wifi_station.h"
 
+#include "application.h"
 #include "board.h"
 #include "dual_network_board.h"
 #include "nt26_board.h"
+#include "ota.h"
 #include "settings.h"
 
 #include "home_screen/home_screen.h"
@@ -59,6 +61,7 @@ constexpr uint32_t kColorItemSel    = 0x2F3A52;
 
 constexpr size_t kMaxSsidLen = 32;
 constexpr size_t kMaxPasswordLen = 64;
+constexpr size_t kMaxOtaUrlLen = 255;
 
 // ---------------------------------------------------------------------------
 // FreeRTOS / WiFi 事件位
@@ -103,6 +106,16 @@ struct UiState {
     lv_obj_t* sim_internal_btn    = nullptr;
     lv_obj_t* sim_internal_lbl    = nullptr;
     lv_obj_t* sim_current_lbl     = nullptr;
+    // OTA 设置
+    lv_obj_t* ota_tab       = nullptr;
+    lv_obj_t* ota_url_lbl   = nullptr;
+    lv_obj_t* ota_source_lbl = nullptr;
+    lv_obj_t* ota_status_lbl = nullptr;
+    lv_obj_t* ota_apply_btn = nullptr;
+    lv_obj_t* ota_apply_lbl = nullptr;
+    lv_obj_t* ota_overlay   = nullptr;
+    lv_obj_t* ota_textarea  = nullptr;
+    lv_obj_t* ota_keyboard  = nullptr;
     // 密码键盘弹窗
     lv_obj_t* pwd_overlay   = nullptr;
     lv_obj_t* pwd_textarea  = nullptr;
@@ -142,6 +155,8 @@ std::string          s_restart_headline;
 // 根本没起过，恢复时跳过即可，避免空跑一份 wifi 栈。
 bool                 s_wifi_station_was_active = false;
 bool                 s_network_switch_pending = false;
+bool                 s_ota_apply_pending = false;
+uint32_t             s_ota_generation = 0;
 
 // 上网方式（network/type NVS key）：与 DualNetworkBoard::LoadNetworkTypeFromSettings
 // 一致。0 = WiFi，1 = 4G（蜂窝模组）。切换由 DualNetworkBoard::SwitchNetworkType()
@@ -181,12 +196,85 @@ void schedule_network_switch(int target_type);
 void refresh_sim_slot_ui();
 void open_sim_switching_popup(int target_slot);
 void schedule_sim_slot_query();
+void refresh_ota_ui();
+void close_ota_popup();
+void open_ota_popup();
+void schedule_ota_apply();
 
 // ---------------------------------------------------------------------------
 // 工具
 // ---------------------------------------------------------------------------
 const char* auth_label(wifi_auth_mode_t mode) {
     return (mode == WIFI_AUTH_OPEN) ? I18n::T("[开放]") : I18n::T("[加密]");
+}
+
+std::string trim_copy(const std::string& text) {
+    size_t begin = 0;
+    while (begin < text.size() &&
+           std::isspace(static_cast<unsigned char>(text[begin]))) {
+        ++begin;
+    }
+    size_t end = text.size();
+    while (end > begin &&
+           std::isspace(static_cast<unsigned char>(text[end - 1]))) {
+        --end;
+    }
+    return text.substr(begin, end - begin);
+}
+
+bool starts_with(const std::string& text, const char* prefix) {
+    const size_t len = std::strlen(prefix);
+    return text.size() >= len && text.compare(0, len, prefix) == 0;
+}
+
+std::string get_saved_ota_url() {
+    Settings settings("wifi", false);
+    return trim_copy(settings.GetString("ota_url"));
+}
+
+std::string get_effective_ota_url() {
+    const std::string saved = get_saved_ota_url();
+    return saved.empty() ? std::string(CONFIG_OTA_URL) : saved;
+}
+
+bool is_custom_ota_url() {
+    return !get_saved_ota_url().empty();
+}
+
+std::string validate_ota_url(const std::string& raw, std::string* normalized) {
+    const std::string url = trim_copy(raw);
+    if (normalized != nullptr) {
+        *normalized = url;
+    }
+    if (url.empty()) {
+        return I18n::T("地址不能为空");
+    }
+    if (url.size() > kMaxOtaUrlLen) {
+        return I18n::T("地址过长");
+    }
+    if (!starts_with(url, "http://") && !starts_with(url, "https://")) {
+        return I18n::T("仅支持 HTTP 或 HTTPS");
+    }
+    for (char c : url) {
+        if (std::isspace(static_cast<unsigned char>(c))) {
+            return I18n::T("地址不能包含空格");
+        }
+    }
+    return {};
+}
+
+void save_ota_url(const std::string& url) {
+    Settings settings("wifi", true);
+    if (url == CONFIG_OTA_URL) {
+        settings.EraseKey("ota_url");
+    } else {
+        settings.SetString("ota_url", url);
+    }
+}
+
+void restore_default_ota_url() {
+    Settings settings("wifi", true);
+    settings.EraseKey("ota_url");
 }
 
 // 把 STA_DISCONNECTED 的 reason 码翻成人话。常见值对应密码错误 / AP 找不到 /
@@ -422,6 +510,70 @@ void post_show_failure(const std::string& title, const std::string& detail,
     if (!s_screen_active) return;
     lv_async_call(async_show_failure,
                   new AsyncFailureMsg{title, detail, auto_close_ms});
+}
+
+struct OtaApplyCtx {
+    uint32_t generation;
+};
+
+struct OtaApplyResult {
+    uint32_t generation;
+    esp_err_t err;
+    std::string url;
+};
+
+void set_ota_apply_enabled(bool enabled) {
+    if (s_ui.ota_apply_btn == nullptr) {
+        return;
+    }
+    if (enabled) {
+        lv_obj_remove_state(s_ui.ota_apply_btn, LV_STATE_DISABLED);
+        if (s_ui.ota_apply_lbl != nullptr) {
+            lv_label_set_text(s_ui.ota_apply_lbl, I18n::T("应用"));
+        }
+    } else {
+        lv_obj_add_state(s_ui.ota_apply_btn, LV_STATE_DISABLED);
+        if (s_ui.ota_apply_lbl != nullptr) {
+            lv_label_set_text(s_ui.ota_apply_lbl, I18n::T("检查中…"));
+        }
+    }
+}
+
+void async_ota_apply_done(void* user_data) {
+    auto* msg = static_cast<OtaApplyResult*>(user_data);
+    if (screen_alive() && msg->generation == s_ota_generation) {
+        s_ota_apply_pending = false;
+        set_ota_apply_enabled(true);
+        if (s_ui.ota_status_lbl != nullptr) {
+            char buf[320];
+            if (msg->err == ESP_OK) {
+                snprintf(buf, sizeof(buf), I18n::T("已应用，当前地址可用\n%s"),
+                         msg->url.c_str());
+                lv_obj_set_style_text_color(s_ui.ota_status_lbl,
+                                            lv_color_hex(kColorSuccess),
+                                            LV_PART_MAIN);
+            } else {
+                snprintf(buf, sizeof(buf), I18n::T("应用失败 code=%d\n%s"),
+                         static_cast<int>(msg->err), msg->url.c_str());
+                lv_obj_set_style_text_color(s_ui.ota_status_lbl,
+                                            lv_color_hex(kColorError),
+                                            LV_PART_MAIN);
+            }
+            lv_label_set_text(s_ui.ota_status_lbl, buf);
+        }
+    }
+    delete msg;
+}
+
+void ota_apply_task(void* arg) {
+    auto* ctx = static_cast<OtaApplyCtx*>(arg);
+    Ota ota;
+    const esp_err_t err = ota.CheckVersion();
+    std::string url = ota.GetCheckVersionUrl();
+    lv_async_call(async_ota_apply_done,
+                  new OtaApplyResult{ctx->generation, err, std::move(url)});
+    delete ctx;
+    vTaskDelete(nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,6 +1172,46 @@ void on_pwd_connect_btn(lv_event_t* /*e*/) {
 
 void on_pwd_cancel_btn(lv_event_t* /*e*/) { close_password_popup(); }
 
+void on_ota_save_btn(lv_event_t* /*e*/) {
+    if (s_ui.ota_textarea == nullptr) {
+        return;
+    }
+    const char* raw = lv_textarea_get_text(s_ui.ota_textarea);
+    std::string url;
+    const std::string error = validate_ota_url(raw ? raw : "", &url);
+    if (!error.empty()) {
+        if (s_ui.ota_status_lbl != nullptr) {
+            lv_label_set_text(s_ui.ota_status_lbl, error.c_str());
+            lv_obj_set_style_text_color(s_ui.ota_status_lbl,
+                                        lv_color_hex(kColorError),
+                                        LV_PART_MAIN);
+        }
+        return;
+    }
+
+    save_ota_url(url);
+    close_ota_popup();
+    refresh_ota_ui();
+    if (s_ui.ota_status_lbl != nullptr) {
+        lv_label_set_text(s_ui.ota_status_lbl,
+                          I18n::T("已保存，下次 OTA 检查生效"));
+        lv_obj_set_style_text_color(s_ui.ota_status_lbl,
+                                    lv_color_hex(kColorSuccess),
+                                    LV_PART_MAIN);
+    }
+}
+
+void on_ota_cancel_btn(lv_event_t* /*e*/) { close_ota_popup(); }
+
+void on_ota_kb_event(lv_event_t* e) {
+    const lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CANCEL) {
+        close_ota_popup();
+    } else if (code == LV_EVENT_READY) {
+        on_ota_save_btn(e);
+    }
+}
+
 void open_password_popup(const std::string& ssid, wifi_auth_mode_t authmode) {
     if (s_ui.screen == nullptr) return;
     close_password_popup();
@@ -1151,6 +1343,110 @@ void close_password_popup() {
     s_pending_ssid.clear();
 }
 
+void open_ota_popup() {
+    if (s_ui.screen == nullptr) {
+        return;
+    }
+    close_ota_popup();
+
+    lv_obj_t* mask = lv_obj_create(s_ui.screen);
+    screen_strip_obj_chrome(mask);
+    lv_obj_set_size(mask, kPanelW, kPanelH);
+    lv_obj_set_pos(mask, 0, 0);
+    lv_obj_set_style_bg_color(mask, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(mask, LV_OPA_70, LV_PART_MAIN);
+    lv_obj_remove_flag(mask, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(mask, LV_OBJ_FLAG_CLICKABLE);
+    screen_swipe_back_ignore(mask, true);
+    s_ui.ota_overlay = mask;
+
+    lv_obj_t* card = lv_obj_create(mask);
+    screen_strip_obj_chrome(card);
+    lv_obj_set_size(card, kPanelW - 60, 280);
+    lv_obj_set_pos(card, 30, 30);
+    lv_obj_set_style_bg_color(card, lv_color_hex(kColorCard), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(card, 18, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card, 20, LV_PART_MAIN);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* title = lv_label_create(card);
+    lv_label_set_text(title, I18n::T("修改 OTA 地址"));
+    lv_obj_set_style_text_color(title, lv_color_hex(kColorText), LV_PART_MAIN);
+    lv_obj_set_style_text_font(title, &font_puhui_30_4, LV_PART_MAIN);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t* hint = lv_label_create(card);
+    lv_label_set_text(hint, I18n::T("保存后下次 OTA 检查使用，点击应用可立即检查"));
+    lv_obj_set_width(hint, kPanelW - 60 - 40);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(hint, lv_color_hex(kColorSubtle), LV_PART_MAIN);
+    lv_obj_set_style_text_font(hint, &font_puhui_20_4, LV_PART_MAIN);
+    lv_obj_align_to(hint, title, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 12);
+
+    lv_obj_t* ta = lv_textarea_create(card);
+    s_ui.ota_textarea = ta;
+    lv_obj_set_size(ta, kPanelW - 60 - 40, 76);
+    lv_obj_align(ta, LV_ALIGN_TOP_LEFT, 0, 96);
+    lv_textarea_set_one_line(ta, false);
+    lv_textarea_set_max_length(ta, kMaxOtaUrlLen);
+    lv_textarea_set_placeholder_text(ta, CONFIG_OTA_URL);
+    lv_textarea_set_text(ta, get_effective_ota_url().c_str());
+    lv_obj_set_style_text_font(ta, &font_puhui_20_4, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(ta, lv_color_hex(0x121726), LV_PART_MAIN);
+    lv_obj_set_style_text_color(ta, lv_color_hex(kColorText), LV_PART_MAIN);
+    lv_obj_set_style_radius(ta, 10, LV_PART_MAIN);
+    lv_obj_add_state(ta, LV_STATE_FOCUSED);
+    screen_swipe_back_ignore(ta, true);
+
+    lv_obj_t* cancel = lv_button_create(card);
+    lv_obj_set_size(cancel, 160, 56);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_RIGHT, -180, 0);
+    lv_obj_set_style_radius(cancel, 16, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(cancel, lv_color_hex(kColorBtn), LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(cancel, 0, LV_PART_MAIN);
+    lv_obj_add_event_cb(cancel, on_ota_cancel_btn, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* cancel_lbl = lv_label_create(cancel);
+    lv_label_set_text(cancel_lbl, I18n::T("取消"));
+    lv_obj_set_style_text_color(cancel_lbl, lv_color_hex(kColorText), LV_PART_MAIN);
+    lv_obj_set_style_text_font(cancel_lbl, &font_puhui_20_4, LV_PART_MAIN);
+    lv_obj_center(cancel_lbl);
+    screen_swipe_back_ignore(cancel, true);
+
+    lv_obj_t* save = lv_button_create(card);
+    lv_obj_set_size(save, 160, 56);
+    lv_obj_align(save, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_radius(save, 16, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(save, lv_color_hex(kColorBtnActive), LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(save, 0, LV_PART_MAIN);
+    lv_obj_add_event_cb(save, on_ota_save_btn, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* save_lbl = lv_label_create(save);
+    lv_label_set_text(save_lbl, I18n::T("保存"));
+    lv_obj_set_style_text_color(save_lbl, lv_color_hex(kColorText), LV_PART_MAIN);
+    lv_obj_set_style_text_font(save_lbl, &font_puhui_20_4, LV_PART_MAIN);
+    lv_obj_center(save_lbl);
+    screen_swipe_back_ignore(save, true);
+
+    lv_obj_t* kb = lv_keyboard_create(mask);
+    s_ui.ota_keyboard = kb;
+    lv_obj_set_size(kb, kPanelW, 390);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+    lv_keyboard_set_textarea(kb, ta);
+    lv_obj_add_event_cb(kb, on_ota_kb_event, LV_EVENT_READY, nullptr);
+    lv_obj_add_event_cb(kb, on_ota_kb_event, LV_EVENT_CANCEL, nullptr);
+    screen_swipe_back_ignore(kb, true);
+}
+
+void close_ota_popup() {
+    if (s_ui.ota_overlay != nullptr) {
+        lv_obj_delete(s_ui.ota_overlay);
+    }
+    s_ui.ota_overlay = nullptr;
+    s_ui.ota_textarea = nullptr;
+    s_ui.ota_keyboard = nullptr;
+}
+
 // ---------------------------------------------------------------------------
 // 连接进度 / 成功弹窗
 //
@@ -1223,10 +1519,11 @@ void open_connecting_popup(const std::string& ssid) {
 }
 
 void reboot_task(void* /*arg*/) {
-    ESP_LOGI(TAG, "wifi configured -> esp_restart");
+    ESP_LOGI(TAG, "network config done -> Application::Reboot()");
     // 给 LVGL 一点点时间把 「正在重启…」 渲染出来
     vTaskDelay(pdMS_TO_TICKS(200));
-    esp_restart();
+    // 走 App 重启：先关背光再 esp_restart，避免过渡花屏
+    Application::GetInstance().Reboot();
 }
 
 void restart_timer_cb(lv_timer_t* /*timer*/) {
@@ -1393,6 +1690,10 @@ void on_swipe_back() {
     if (s_ui.status_overlay != nullptr) {
         return;
     }
+    if (s_ui.ota_overlay != nullptr) {
+        close_ota_popup();
+        return;
+    }
     if (s_ui.pwd_overlay != nullptr) {
         close_password_popup();
         return;
@@ -1436,6 +1737,17 @@ void on_screen_unloaded(lv_event_t* /*e*/) {
     s_ui.sim_internal_btn = nullptr;
     s_ui.sim_internal_lbl = nullptr;
     s_ui.sim_current_lbl  = nullptr;
+    s_ui.ota_tab          = nullptr;
+    s_ui.ota_url_lbl      = nullptr;
+    s_ui.ota_source_lbl   = nullptr;
+    s_ui.ota_status_lbl   = nullptr;
+    s_ui.ota_apply_btn    = nullptr;
+    s_ui.ota_apply_lbl    = nullptr;
+    s_ui.ota_overlay      = nullptr;
+    s_ui.ota_textarea     = nullptr;
+    s_ui.ota_keyboard     = nullptr;
+    s_ota_apply_pending = false;
+    ++s_ota_generation;
     s_network_switch_pending = false;
     // 注意：s_sim_switch_pending 不在这里清零——AT 任务可能还在后台跑，
     // 它结束后回调里会检测 screen_alive() 并自行复位。
@@ -1916,9 +2228,163 @@ void on_sim_internal_clicked(lv_event_t* /*e*/) {
     schedule_sim_switch(kSimSlotInternal);
 }
 
+void refresh_ota_ui() {
+    if (s_ui.ota_url_lbl == nullptr) {
+        return;
+    }
+    const std::string url = get_effective_ota_url();
+    lv_label_set_text(s_ui.ota_url_lbl, url.c_str());
+    if (s_ui.ota_source_lbl != nullptr) {
+        lv_label_set_text(s_ui.ota_source_lbl,
+                          is_custom_ota_url() ? I18n::T("来源：自定义地址")
+                                              : I18n::T("来源：默认地址"));
+    }
+}
+
+void on_ota_edit_clicked(lv_event_t* /*e*/) {
+    open_ota_popup();
+}
+
+void on_ota_restore_clicked(lv_event_t* /*e*/) {
+    restore_default_ota_url();
+    refresh_ota_ui();
+    if (s_ui.ota_status_lbl != nullptr) {
+        lv_label_set_text(s_ui.ota_status_lbl, I18n::T("已恢复默认地址"));
+        lv_obj_set_style_text_color(s_ui.ota_status_lbl,
+                                    lv_color_hex(kColorSuccess),
+                                    LV_PART_MAIN);
+    }
+}
+
+void schedule_ota_apply() {
+    if (s_ota_apply_pending) {
+        return;
+    }
+    s_ota_apply_pending = true;
+    set_ota_apply_enabled(false);
+    if (s_ui.ota_status_lbl != nullptr) {
+        lv_label_set_text(s_ui.ota_status_lbl, I18n::T("正在检查当前 OTA 地址…"));
+        lv_obj_set_style_text_color(s_ui.ota_status_lbl,
+                                    lv_color_hex(kColorScanning),
+                                    LV_PART_MAIN);
+    }
+
+    auto* ctx = new OtaApplyCtx{++s_ota_generation};
+    if (xTaskCreate(ota_apply_task, "ota_apply", 8192, ctx, 5, nullptr) !=
+        pdPASS) {
+        delete ctx;
+        s_ota_apply_pending = false;
+        set_ota_apply_enabled(true);
+        if (s_ui.ota_status_lbl != nullptr) {
+            lv_label_set_text(s_ui.ota_status_lbl,
+                              I18n::T("无法启动 OTA 检查任务"));
+            lv_obj_set_style_text_color(s_ui.ota_status_lbl,
+                                        lv_color_hex(kColorError),
+                                        LV_PART_MAIN);
+        }
+    }
+}
+
+void on_ota_apply_clicked(lv_event_t* /*e*/) {
+    schedule_ota_apply();
+}
+
 // ---------------------------------------------------------------------------
 // UI 组装
 // ---------------------------------------------------------------------------
+lv_obj_t* make_ota_action_btn(lv_obj_t* parent, const char* text,
+                              uint32_t color, lv_event_cb_t cb) {
+    lv_obj_t* btn = lv_button_create(parent);
+    lv_obj_set_size(btn, 190, 60);
+    lv_obj_set_style_radius(btn, 14, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(color), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(kColorBtn),
+                              LV_PART_MAIN | LV_STATE_DISABLED);
+    lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, nullptr);
+    screen_swipe_back_ignore(btn, true);
+    lv_obj_t* lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(kColorText), LV_PART_MAIN);
+    lv_obj_set_style_text_font(lbl, &font_puhui_20_4, LV_PART_MAIN);
+    lv_obj_center(lbl);
+    if (cb == on_ota_apply_clicked) {
+        s_ui.ota_apply_btn = btn;
+        s_ui.ota_apply_lbl = lbl;
+    }
+    return btn;
+}
+
+void build_ota_tab(lv_obj_t* tv) {
+    lv_obj_t* tab = lv_tabview_add_tab(tv, I18n::T("OTA 设置"));
+    s_ui.ota_tab = tab;
+    lv_obj_set_style_pad_all(tab, 24, LV_PART_MAIN);
+    lv_obj_remove_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* card = lv_obj_create(tab);
+    screen_strip_obj_chrome(card);
+    lv_obj_set_size(card, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(card, lv_color_hex(kColorCard), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(card, 18, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card, 24, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(card, 16, LV_PART_MAIN);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START);
+
+    lv_obj_t* title = lv_label_create(card);
+    lv_label_set_text(title, I18n::T("OTA 设置"));
+    lv_obj_set_style_text_color(title, lv_color_hex(kColorText), LV_PART_MAIN);
+    lv_obj_set_style_text_font(title, &font_puhui_30_4, LV_PART_MAIN);
+
+    lv_obj_t* source = lv_label_create(card);
+    s_ui.ota_source_lbl = source;
+    lv_obj_set_style_text_color(source, lv_color_hex(kColorSubtle),
+                                LV_PART_MAIN);
+    lv_obj_set_style_text_font(source, &font_puhui_20_4, LV_PART_MAIN);
+
+    lv_obj_t* label = lv_label_create(card);
+    lv_label_set_text(label, I18n::T("当前地址"));
+    lv_obj_set_style_text_color(label, lv_color_hex(kColorText), LV_PART_MAIN);
+    lv_obj_set_style_text_font(label, &font_puhui_20_4, LV_PART_MAIN);
+
+    lv_obj_t* url = lv_label_create(card);
+    s_ui.ota_url_lbl = url;
+    lv_obj_set_width(url, LV_PCT(100));
+    lv_label_set_long_mode(url, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(url, lv_color_hex(kColorText), LV_PART_MAIN);
+    lv_obj_set_style_text_font(url, &font_puhui_20_4, LV_PART_MAIN);
+
+    lv_obj_t* row = lv_obj_create(card);
+    screen_strip_obj_chrome(row);
+    lv_obj_set_size(row, LV_PCT(100), 72);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    make_ota_action_btn(row, I18n::T("修改地址"), kColorBtnActive,
+                        on_ota_edit_clicked);
+    make_ota_action_btn(row, I18n::T("恢复默认"), kColorBtnDanger,
+                        on_ota_restore_clicked);
+    make_ota_action_btn(row, I18n::T("应用"), kColorBtnAccent,
+                        on_ota_apply_clicked);
+
+    lv_obj_t* status = lv_label_create(card);
+    s_ui.ota_status_lbl = status;
+    lv_label_set_text(status, I18n::T("修改后点击应用可立即检查当前地址"));
+    lv_obj_set_width(status, LV_PCT(100));
+    lv_label_set_long_mode(status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(status, lv_color_hex(kColorSubtle),
+                                LV_PART_MAIN);
+    lv_obj_set_style_text_font(status, &font_puhui_20_4, LV_PART_MAIN);
+
+    refresh_ota_ui();
+}
+
 void build_header(lv_obj_t* parent) {
     lv_obj_t* header = lv_obj_create(parent);
     screen_strip_obj_chrome(header);
@@ -2324,8 +2790,10 @@ void build_tabview(lv_obj_t* parent) {
     if (IsCellularMode()) {
         build_sim_switch_tab();
         build_network_switch_tab();
+        build_ota_tab(tv);
     } else {
         build_network_switch_tab();
+        build_ota_tab(tv);
     }
 }
 
@@ -2379,6 +2847,7 @@ void NetworkScreen::LifecycleCallback(screen_lifecycle_event_t event) {
         }
         refresh_network_switch_ui();
         refresh_sim_slot_ui();
+        refresh_ota_ui();
         // 4G 模式下向模组发 AT+ECSIMCFG? 同步真实当前槽位，避免本地 NVS
         // 与模组里实际生效的卡不一致（例如设备外部曾经手动切过卡）。
         if (IsCellularMode()) {

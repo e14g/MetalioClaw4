@@ -489,6 +489,9 @@ void AudioService::EnableVoiceProcessing(bool enable) {
             audio_processor_initialized_ = true;
         }
 
+#if CONFIG_USE_DEVICE_AEC
+        audio_processor_->EnableDeviceAec(device_aec_enabled_);
+#endif
         /* We should make sure no audio is playing */
         ResetDecoder();
         audio_input_need_warmup_ = true;
@@ -511,6 +514,18 @@ void AudioService::EnableAudioTesting(bool enable) {
         audio_decode_queue_ = std::move(audio_testing_queue_);
         audio_queue_cv_.notify_all();
     }
+}
+
+void AudioService::SetDeviceAecEnabled(bool enable) {
+#if CONFIG_USE_DEVICE_AEC
+    device_aec_enabled_ = enable;
+    ESP_LOGI(TAG, "Device AEC preference: %s", enable ? "enabled" : "disabled");
+#else
+    device_aec_enabled_ = false;
+    if (enable) {
+        ESP_LOGW(TAG, "Device AEC is not compiled in");
+    }
+#endif
 }
 
 void AudioService::EnableDeviceAec(bool enable) {

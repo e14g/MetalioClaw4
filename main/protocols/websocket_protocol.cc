@@ -205,8 +205,18 @@ std::string WebsocketProtocol::GetHelloMessage() {
     cJSON_AddStringToObject(root, "type", "hello");
     cJSON_AddNumberToObject(root, "version", version_);
     cJSON* features = cJSON_CreateObject();
+#if CONFIG_USE_DEVICE_AEC
+    const bool kDeviceAecEnabled = Application::GetInstance().IsDeviceAecEnabled();
+    cJSON_AddBoolToObject(features, "device_aec", kDeviceAecEnabled);
+    cJSON_AddBoolToObject(features, "device_aec_ready", kDeviceAecEnabled);
+#else
+    constexpr bool kDeviceAecEnabled = false;
+#endif
 #if CONFIG_USE_SERVER_AEC
+    constexpr bool kServerAecEnabled = true;
     cJSON_AddBoolToObject(features, "aec", true);
+#else
+    constexpr bool kServerAecEnabled = false;
 #endif
     cJSON_AddBoolToObject(features, "mcp", true);
     cJSON_AddItemToObject(root, "features", features);
@@ -221,6 +231,10 @@ std::string WebsocketProtocol::GetHelloMessage() {
     std::string message(json_str);
     cJSON_free(json_str);
     cJSON_Delete(root);
+    ESP_LOGI(TAG, "WebSocket hello features mcp=true device_aec=%s device_aec_ready=%s server_aec=%s",
+        kDeviceAecEnabled ? "true" : "false",
+        kDeviceAecEnabled ? "true" : "false",
+        kServerAecEnabled ? "true" : "false");
     return message;
 }
 

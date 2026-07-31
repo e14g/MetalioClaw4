@@ -5,6 +5,7 @@
 
 #include <esp_log.h>
 
+#include "application.h"
 #include "audio_codec.h"
 #include "backlight.h"
 #include "bluetooth_screen/bluetooth_screen.h"
@@ -50,11 +51,15 @@ struct UiState {
     lv_obj_t* enter_standby_slider = nullptr;
     lv_obj_t* shutdown_min_label = nullptr;
     lv_obj_t* shutdown_slider = nullptr;
+    lv_obj_t* aec_switch = nullptr;
+    lv_obj_t* aec_state_label = nullptr;
+    lv_obj_t* aec_hint_label = nullptr;
 };
 UiState s_ui;
 
 void OnSwipeBack();
 void OnBackClicked(lv_event_t* e);
+void RefreshAecUi();
 
 int ReadInitialBrightness() {
     int value = kBacklightDefaultPercent;
@@ -334,6 +339,104 @@ void BuildVolumeTab(lv_obj_t* tab, int initial_volume) {
     lv_obj_set_style_text_font(foot, &font_puhui_20_4, LV_PART_MAIN);
 }
 
+void RefreshAecUi() {
+    auto& app = Application::GetInstance();
+    const bool supported = app.IsDeviceAecSupported();
+    const bool enabled = app.IsDeviceAecEnabled();
+
+    if (s_ui.aec_switch != nullptr) {
+        if (supported) {
+            lv_obj_remove_state(s_ui.aec_switch, LV_STATE_DISABLED);
+        } else {
+            lv_obj_add_state(s_ui.aec_switch, LV_STATE_DISABLED);
+        }
+        if (enabled) {
+            lv_obj_add_state(s_ui.aec_switch, LV_STATE_CHECKED);
+        } else {
+            lv_obj_remove_state(s_ui.aec_switch, LV_STATE_CHECKED);
+        }
+    }
+
+    if (s_ui.aec_state_label != nullptr) {
+        lv_label_set_text(s_ui.aec_state_label,
+                          !supported ? I18n::T("固件不支持")
+                                     : (enabled ? I18n::T("已开启")
+                                                : I18n::T("已关闭")));
+    }
+    if (s_ui.aec_hint_label != nullptr) {
+        lv_label_set_text(s_ui.aec_hint_label,
+                          supported
+                              ? I18n::T("切换后从下一次唤醒或重新进入聊天生效")
+                              : I18n::T("当前固件未编译设备端 AEC"));
+    }
+}
+
+void OnAecSwitchChanged(lv_event_t* e) {
+    auto& app = Application::GetInstance();
+    if (!app.IsDeviceAecSupported()) {
+        RefreshAecUi();
+        return;
+    }
+
+    auto* sw = static_cast<lv_obj_t*>(lv_event_get_target(e));
+    const bool enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    app.SetDeviceAecEnabled(enabled);
+    RefreshAecUi();
+}
+
+void BuildAudioTab(lv_obj_t* tab) {
+    lv_obj_set_style_pad_all(tab, 24, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(tab, 16, LV_PART_MAIN);
+    lv_obj_set_flex_flow(tab, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(tab, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START);
+    lv_obj_remove_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* card = lv_obj_create(tab);
+    screen_strip_obj_chrome(card);
+    lv_obj_set_width(card, LV_PCT(100));
+    lv_obj_set_height(card, 190);
+    lv_obj_set_style_bg_color(card, lv_color_hex(kColorCard), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(card, 20, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card, 24, LV_PART_MAIN);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    screen_make_input_passive(card);
+
+    lv_obj_t* title = lv_label_create(card);
+    lv_label_set_text(title, I18n::T("设备端 AEC"));
+    lv_obj_set_style_text_color(title, lv_color_hex(kColorText), LV_PART_MAIN);
+    lv_obj_set_style_text_font(title, &font_puhui_30_4, LV_PART_MAIN);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t* state = lv_label_create(card);
+    s_ui.aec_state_label = state;
+    lv_obj_set_style_text_color(state, lv_color_hex(kColorValue), LV_PART_MAIN);
+    lv_obj_set_style_text_font(state, &font_puhui_20_4, LV_PART_MAIN);
+    lv_obj_align_to(state, title, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 10);
+
+    lv_obj_t* hint = lv_label_create(card);
+    s_ui.aec_hint_label = hint;
+    lv_obj_set_width(hint, 430);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(hint, lv_color_hex(kColorSubtle), LV_PART_MAIN);
+    lv_obj_set_style_text_font(hint, &font_puhui_20_4, LV_PART_MAIN);
+    lv_obj_align_to(hint, state, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 12);
+
+    lv_obj_t* sw = lv_switch_create(card);
+    s_ui.aec_switch = sw;
+    lv_obj_set_size(sw, 96, 48);
+    lv_obj_align(sw, LV_ALIGN_RIGHT_MID, -8, 0);
+    lv_obj_set_style_bg_color(sw, lv_color_hex(kColorSliderTrack), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(sw, lv_color_hex(kColorAccent),
+                              LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(sw, lv_color_hex(0xFFFFFF), LV_PART_KNOB);
+    lv_obj_add_event_cb(sw, OnAecSwitchChanged, LV_EVENT_VALUE_CHANGED, nullptr);
+    screen_swipe_back_ignore(sw, true);
+
+    RefreshAecUi();
+}
+
 void BuildHeader(lv_obj_t* parent) {
     lv_obj_t* header = lv_obj_create(parent);
     screen_strip_obj_chrome(header);
@@ -528,6 +631,9 @@ void BuildTabView(lv_obj_t* parent) {
     lv_obj_t* tab_volume = lv_tabview_add_tab(tv, I18n::T("音量"));
     BuildVolumeTab(tab_volume, initial_volume);
 
+    lv_obj_t* tab_audio = lv_tabview_add_tab(tv, I18n::T("音频"));
+    BuildAudioTab(tab_audio);
+
     lv_obj_t* tab_language = lv_tabview_add_tab(tv, I18n::T("语言"));
     BuildLanguageTab(tab_language);
 
@@ -564,6 +670,9 @@ void OnScreenUnloaded(lv_event_t* /*e*/) {
     s_ui.enter_standby_slider = nullptr;
     s_ui.shutdown_min_label = nullptr;
     s_ui.shutdown_slider = nullptr;
+    s_ui.aec_switch = nullptr;
+    s_ui.aec_state_label = nullptr;
+    s_ui.aec_hint_label = nullptr;
 }
 
 }  // namespace

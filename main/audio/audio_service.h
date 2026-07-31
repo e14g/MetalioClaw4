@@ -109,6 +109,8 @@ public:
     void EnableWakeWordDetection(bool enable);
     void EnableVoiceProcessing(bool enable);
     void EnableAudioTesting(bool enable);
+    void SetDeviceAecEnabled(bool enable);
+    bool IsDeviceAecEnabled() const { return device_aec_enabled_; }
     void EnableDeviceAec(bool enable);
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);
@@ -155,6 +157,7 @@ private:
     bool voice_detected_ = false;
     bool service_stopped_ = true;
     bool audio_input_need_warmup_ = false;
+    bool device_aec_enabled_ = false;
 
     esp_timer_handle_t audio_power_timer_ = nullptr;
     std::chrono::steady_clock::time_point last_input_time_;
